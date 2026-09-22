@@ -1,0 +1,18 @@
+{
+  "model": {
+    "CapImagine-7B": {
+      "class": "Qwen2VLChat",
+      "model_path": "Michael4933/CapImagine-7B",
+      "min_pixels": 1003520,
+      "max_pixels": 12845056,
+      "use_custom_prompt": false,
+      "system_prompt": "You are a helpful multimodal assistant. You are required to answer the question based on the image provided. Put your final answer in \\boxed{}."
+    }
+  },
+  "data": {
+    "VStarBench": {
+      "class": "ImageMCQDataset",
+      "dataset": "VStarBench"
+    }
+  }
+}

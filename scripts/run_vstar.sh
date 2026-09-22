@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# Evaluate CapImagine-7B (or the Qwen2.5-VL-7B baseline) on V* Bench with VLMEvalKit,
+# then print Attribute / Spatial / Overall accuracy next to the paper's Table 1.
+#
+# Env vars:
+#   MODEL        capimagine (default) | qwen25vl
+#   MODEL_PATH   weights dir or HF repo id (default: models/<name> if present, else the HF repo id)
+#   JUDGE        VLMEvalKit judge (default: chatgpt-0125 = gpt-3.5-turbo-0125, VLMEvalKit's MCQ
+#                default at the pinned commit). exact_matching disables the LLM judge (not the
+#                paper protocol).
+#   USE_VLLM     1 = VLMEvalKit's vLLM backend; default 0 = HF transformers (official Qwen2.5-VL code)
+#   NGPU         data-parallel processes for the transformers backend (default: 1)
+#   MODE         all (default) | infer | eval   (passed to VLMEvalKit's --mode)
+#   REUSE        1 = reuse the latest earlier predictions (VLMEvalKit --reuse); default 1 for
+#                MODE=eval, else 0 (without it VLMEvalKit moves today's earlier outputs to bak_*)
+#   WORK_DIR     output root (default: outputs/)
+#   VLMEVAL_DIR  VLMEvalKit checkout (default: third_party/VLMEvalKit)
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VLMEVAL_DIR="${VLMEVAL_DIR:-$REPO_DIR/third_party/VLMEvalKit}"
+VLMEVAL_COMMIT=0bac5c064e8216037141d2cbd525e66b4b1dce99
+MODEL="${MODEL:-capimagine}"
+JUDGE="${JUDGE:-chatgpt-0125}"
+USE_VLLM="${USE_VLLM:-0}"
+NGPU="${NGPU:-1}"
+MODE="${MODE:-all}"
+if [ "$MODE" = eval ]; then REUSE="${REUSE:-1}"; else REUSE="${REUSE:-0}"; fi
+WORK_DIR="$(mkdir -p "${WORK_DIR:-$REPO_DIR/outputs}" && cd "${WORK_DIR:-$REPO_DIR/outputs}" && pwd)"
+
+case "$MODEL" in
+  capimagine) CONFIG="$REPO_DIR/configs/vstar_capimagine.json"; NAME=CapImagine-7B; HF_ID=Michael4933/CapImagine-7B ;;
+  qwen25vl)   CONFIG="$REPO_DIR/configs/vstar_qwen25vl.json"; NAME=Qwen2.5-VL-7B-Instruct; HF_ID=Qwen/Qwen2.5-VL-7B-Instruct ;;
+  *) echo "Unknown MODEL=$MODEL (expected capimagine or qwen25vl)" >&2; exit 1 ;;
+esac
+if [ -z "${MODEL_PATH:-}" ]; then
+  if [ -d "$REPO_DIR/models/$NAME" ]; then MODEL_PATH="$REPO_DIR/models/$NAME"; else MODEL_PATH="$HF_ID"; fi
+fi
+
+actual_commit="$(git -C "$VLMEVAL_DIR" rev-parse HEAD)"
+if [ "$actual_commit" != "$VLMEVAL_COMMIT" ]; then
+  echo "WARNING: VLMEvalKit is at $actual_commit, not the pinned $VLMEVAL_COMMIT; MCQ matching may differ." >&2
+fi
+
+if [ "$MODE" != infer ] && [ "$JUDGE" != exact_matching ]; then
+  (cd "$VLMEVAL_DIR" && python "$REPO_DIR/scripts/check_judge.py" --judge "$JUDGE")
+fi
+
+# Point the config at the chosen weights.
+RENDERED="$WORK_DIR/${NAME}_vstar_config.json"
+python - "$CONFIG" "$NAME" "$MODEL_PATH" "$RENDERED" <<'EOF'
+import json, sys
+src, name, model_path, dst = sys.argv[1:]
+with open(src) as f:
+    cfg = json.load(f)
+cfg['model'][name]['model_path'] = model_path
+with open(dst, 'w') as f:
+    json.dump(cfg, f, indent=2)
+EOF
+echo "Model: $NAME <- $MODEL_PATH | judge: $JUDGE | vLLM: $USE_VLLM | config: $RENDERED"
+
+ARGS=(--config "$RENDERED" --work-dir "$WORK_DIR" --judge "$JUDGE" --mode "$MODE")
+if [ "$REUSE" = 1 ]; then ARGS+=(--reuse); fi
+cd "$VLMEVAL_DIR"
+if [ "$USE_VLLM" = 1 ]; then
+  export VLLM_WORKER_MULTIPROC_METHOD=spawn
+  python run.py "${ARGS[@]}" --use-vllm
+elif [ "$NGPU" -gt 1 ]; then
+  torchrun --nproc-per-node="$NGPU" run.py "${ARGS[@]}"
+else
+  python run.py "${ARGS[@]}"
+fi
+cd "$REPO_DIR"
+
+if [ "$MODE" != infer ]; then
+  python "$REPO_DIR/scripts/summarize_vstar.py" --work-dir "$WORK_DIR" --model-name "$NAME" --judge "$JUDGE"
+fi
