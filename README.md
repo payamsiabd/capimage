@@ -108,5 +108,6 @@ scripts/download.sh             model weights and V* data
 scripts/run_vstar.sh            judge check -> VLMEvalKit inference + evaluation -> summary
 scripts/check_judge.py          fails fast if the judge API does not answer
 scripts/summarize_vstar.py      Attribute / Spatial / Overall vs. the paper, plus sanity warnings
-tests/                          offline tests for the summary logic (pytest)
+tests/                          offline tests (pytest): summary logic, plus VLMEvalKit's own V* prompt
+                                and scoring code on synthetic outputs (runs when vlmeval is installed)
 ```

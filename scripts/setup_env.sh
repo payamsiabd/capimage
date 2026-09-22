@@ -43,9 +43,12 @@ fi
 git -C "$VLMEVAL_DIR" fetch -q --depth 1 origin "$VLMEVAL_COMMIT"
 git -C "$VLMEVAL_DIR" checkout -q "$VLMEVAL_COMMIT"
 pip install -e "$VLMEVAL_DIR"
+# vlmeval/dataset/foxbench.py imports `rouge`, which VLMEvalKit's requirements.txt omits at this commit.
+pip install rouge
 
 # VLMEvalKit's own requirements are unpinned; re-assert ours in case pip drifted.
 pip install "${PINS[@]}"
+python -c "import vlmeval" 2>/dev/null || { python -c "import vlmeval"; echo "import vlmeval failed" >&2; exit 1; }
 
 python - <<'EOF'
 import importlib.metadata as md

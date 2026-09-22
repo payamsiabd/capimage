@@ -73,7 +73,7 @@ def test_vstar_prompt_matches_protocol():
     dataset = object.__new__(ImageMCQDataset)
     dataset.meta_only = True
     msgs = dataset.build_prompt(meta.iloc[4])
-    assert msgs[0] == dict(type='image', value=['4.jpg'])
+    assert msgs[0] == dict(type='image', value='4.jpg')
     assert msgs[1]['value'] == ('Question: Is the dog on the left or right side of the cat?\n'
                                 'Options:\nA. left\nB. right\n'
                                 'Please select the correct answer from the options above. \n')

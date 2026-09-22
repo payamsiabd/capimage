@@ -136,9 +136,10 @@ def format_report(summary, model_name, result_file, judge):
         if summary['splits'][name]['n'] != expected:
             warnings.append(f'{name} has {summary["splits"][name]["n"]} questions; V* has {expected}.')
     if summary['n_exact_match_fallback']:
+        cause = 'JUDGE=exact_matching' if judge == 'exact_matching' else 'the judge API was not working'
         warnings.append(
-            f'{summary["n_exact_match_fallback"]} answers were scored by exact matching only: the judge API was '
-            'not working, so this is not the paper protocol. Fix the judge and re-run with --mode eval.'
+            f'{summary["n_exact_match_fallback"]} answers were scored by exact matching only ({cause}), so this is '
+            'not the paper protocol. Re-score with a working judge: MODE=eval bash scripts/run_vstar.sh'
         )
     if summary['n_random_fallback']:
         warnings.append(
