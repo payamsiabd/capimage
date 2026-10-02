@@ -3,3 +3,5 @@ models/
 third_party/
 __pycache__/
 .pytest_cache/
+data/
+checkpoints/

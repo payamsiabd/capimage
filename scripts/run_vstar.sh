@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Evaluate CapImagine-7B (or the Qwen2.5-VL-7B baseline) on V* Bench with VLMEvalKit,
-# then print Attribute / Spatial / Overall accuracy next to the paper's Table 1.
+# Evaluate CapImagine-7B (or the Qwen2.5-VL-7B baseline, or your own fine-tune) on V* Bench with
+# VLMEvalKit, then print Attribute / Spatial / Overall accuracy next to the paper's Table 1.
 #
 # Env vars:
-#   MODEL        capimagine (default) | qwen25vl
+#   MODEL        capimagine (default) | qwen25vl | custom (a merged fine-tune; needs MODEL_PATH)
 #   MODEL_PATH   weights dir or HF repo id (default: models/<name> if present, else the HF repo id)
+#   MODEL_NAME   output name for MODEL=custom (default: basename of MODEL_PATH)
 #   JUDGE        VLMEvalKit judge (default: chatgpt-0125 = gpt-3.5-turbo-0125, VLMEvalKit's MCQ
 #                default at the pinned commit). exact_matching disables the LLM judge (not the
 #                paper protocol).
@@ -31,11 +32,18 @@ WORK_DIR="$(mkdir -p "${WORK_DIR:-$REPO_DIR/outputs}" && cd "${WORK_DIR:-$REPO_D
 case "$MODEL" in
   capimagine) CONFIG="$REPO_DIR/configs/vstar_capimagine.json"; NAME=CapImagine-7B; HF_ID=Michael4933/CapImagine-7B ;;
   qwen25vl)   CONFIG="$REPO_DIR/configs/vstar_qwen25vl.json"; NAME=Qwen2.5-VL-7B-Instruct; HF_ID=Qwen/Qwen2.5-VL-7B-Instruct ;;
-  *) echo "Unknown MODEL=$MODEL (expected capimagine or qwen25vl)" >&2; exit 1 ;;
+  custom)
+    : "${MODEL_PATH:?MODEL=custom needs MODEL_PATH (e.g. a train/merge_lora.py output dir)}"
+    CONFIG="$REPO_DIR/configs/vstar_capimagine.json"  # same protocol as CapImagine-7B
+    NAME="${MODEL_NAME:-$(basename "$MODEL_PATH")}"; HF_ID=""; REFERENCE="${REFERENCE:-CapImagine-7B}" ;;
+  *) echo "Unknown MODEL=$MODEL (expected capimagine, qwen25vl or custom)" >&2; exit 1 ;;
 esac
+REFERENCE="${REFERENCE:-$NAME}"
 if [ -z "${MODEL_PATH:-}" ]; then
   if [ -d "$REPO_DIR/models/$NAME" ]; then MODEL_PATH="$REPO_DIR/models/$NAME"; else MODEL_PATH="$HF_ID"; fi
 fi
+# run.py executes inside VLMEVAL_DIR, so make local paths absolute.
+if [ -d "$MODEL_PATH" ]; then MODEL_PATH="$(cd "$MODEL_PATH" && pwd)"; fi
 
 actual_commit="$(git -C "$VLMEVAL_DIR" rev-parse HEAD)"
 if [ "$actual_commit" != "$VLMEVAL_COMMIT" ]; then
@@ -53,7 +61,8 @@ import json, sys
 src, name, model_path, dst = sys.argv[1:]
 with open(src) as f:
     cfg = json.load(f)
-cfg['model'][name]['model_path'] = model_path
+(entry,) = cfg['model'].values()
+cfg['model'] = {name: {**entry, 'model_path': model_path}}
 with open(dst, 'w') as f:
     json.dump(cfg, f, indent=2)
 EOF
@@ -73,5 +82,6 @@ fi
 cd "$REPO_DIR"
 
 if [ "$MODE" != infer ]; then
-  python "$REPO_DIR/scripts/summarize_vstar.py" --work-dir "$WORK_DIR" --model-name "$NAME" --judge "$JUDGE"
+  python "$REPO_DIR/scripts/summarize_vstar.py" --work-dir "$WORK_DIR" --model-name "$NAME" --judge "$JUDGE" \
+    --reference "$REFERENCE"
 fi

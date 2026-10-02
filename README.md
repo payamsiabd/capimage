@@ -59,7 +59,9 @@ bash scripts/run_vstar.sh          # inference + judge + comparison with the pap
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `MODEL` | `capimagine` | `qwen25vl` evaluates the Qwen2.5-VL-7B base model to sanity-check the pipeline (download it with `WITH_BASELINE=1 bash scripts/download.sh`) |
+| `MODEL` | `capimagine` | `qwen25vl` evaluates the Qwen2.5-VL-7B base model to sanity-check the pipeline (download it with `WITH_BASELINE=1 bash scripts/download.sh`). `custom` evaluates your own merged fine-tune at `MODEL_PATH` (see [LoRA fine-tuning](#lora-fine-tuning-on-capimagine-data)). |
+| `MODEL_NAME` | basename of `MODEL_PATH` | Output name for `MODEL=custom` |
+| `REFERENCE` | `CapImagine-7B` for `custom` | Which paper row the summary compares against |
 | `JUDGE` | `chatgpt-0125` | Any VLMEvalKit judge name, e.g. `gpt-4o-mini`. `exact_matching` turns the LLM judge off (not the paper protocol). |
 | `USE_VLLM` | `0` | `1` uses VLMEvalKit's vLLM backend (faster; doesn't need flash-attn) |
 | `NGPU` | `1` | Number of data-parallel processes for the transformers backend (uses `torchrun`) |
@@ -98,6 +100,35 @@ The files are in `outputs/CapImagine-7B/T<date>_G0bac5c06/`:
 
 The **boxed-only** column is a judge-free check that reads the answer only from the last `\boxed{}` in each output. It is not the paper's metric; it shows how much the judge changes the score. The summary also warns if the judge fell back to exact matching or if VLMEvalKit substituted a random option after judge failures.
 
+## LoRA fine-tuning on CapImagine-Data
+
+`train/` fine-tunes Qwen2.5-VL-7B-Instruct with LoRA adapters (PEFT) on [CapImagine-Data](https://huggingface.co/datasets/Michael4933/CapImagine-Data), the 17k-sample text-imagination dataset from the paper (§4.2). The paper itself fine-tunes all of the language model's weights with the Monet codebase. This is the LoRA counterpart, so expect it to land near CapImagine-7B, not necessarily on it.
+
+| Setting | Value | Source |
+|---|---|---|
+| Base model | Qwen2.5-VL-7B-Instruct, vision tower frozen | Paper §5.1; Monet `src/main.py` freezes `model.visual` |
+| Global batch | 128 (8 GPUs × batch 1 × grad accum 16; `GLOBAL_BATCH` keeps it constant on fewer GPUs) | Paper §5.1 and Monet's SFT launch script |
+| Epochs / warmup / weight decay / precision | 4 / 10 steps / 0.01 / bf16, linear decay | Monet `script_examples/sft_stage1.sh` and `src/main.py` |
+| System prompt | `You are a helpful assistant.` (replaces the data's own) | Monet `src/task.py` |
+| Image budget | ≤2000 visual tokens per sample, ≤1280 per image once over budget | Monet `resize_by_token_budget` defaults |
+| Loss | Assistant tokens only, including the closing `<|im_end|>`, averaged over all tokens in an optimizer step | Standard SFT masking (see the note on loss scaling below) |
+| LoRA | rank 64, alpha 128, dropout 0.05, lr 1e-4, on every q/k/v/o and gate/up/down projection of the language model | Our choice; common LoRA settings, not from the paper |
+
+**Loss scaling.** In transformers 4.54, Qwen2.5-VL's `forward` accepts `num_items_in_batch` but never uses it. Trainer then assumes the model already normalizes the loss and skips dividing it by the accumulation steps, so with the built-in loss every step's loss and gradients are 16× too large. `train_lora.py` passes its own `compute_loss_func` to fix this, and a test checks that the loss of a random model starts near ln(vocab).
+
+**The data format could not be inspected.** Hugging Face was unreachable from the sandbox where this code was written. The loader expects Monet's layout (`{"data": [{"role", "content": [{"type": "image" | "text", ...}]}]}`), since CapImagine-Data was rewritten from Monet-SFT-125K. It also accepts OpenAI-style `messages` and LLaVA-style `conversations` records. Anything else fails at load time with the offending record printed. CapImagine verbalizes intermediate images as text (`<think_image>…</think_image>`), so an image inside an assistant turn is treated as a format error. Pass `--assistant_images drop` to strip such images instead. **Run `inspect_data` before training** and check that its output looks like the paper's Figure 3.
+
+```bash
+bash scripts/setup_env.sh && conda activate capimagine   # now also installs peft==0.17.1
+bash scripts/download_data.sh                             # CapImagine-Data (+ unzip images) and the base model
+python -m train.inspect_data --data_path data/CapImagine-Data/<annotation>.json
+bash scripts/train_lora.sh                                # all visible GPUs; adapters -> checkpoints/capimagine-lora
+python -m train.merge_lora --adapter checkpoints/capimagine-lora --output checkpoints/capimagine-lora-merged
+MODEL=custom MODEL_PATH=checkpoints/capimagine-lora-merged bash scripts/run_vstar.sh
+```
+
+`train_lora.sh` takes `DATA`, `IMAGE_ROOT`, `BASE_MODEL`, `OUTPUT_DIR`, `NGPU` and `GLOBAL_BATCH` as env vars. Any extra arguments go to `train.train_lora`, which also accepts every `transformers.TrainingArguments` flag, e.g. `--num_train_epochs 2 --report_to wandb`. An adapter is saved after each epoch in `checkpoint-*`. The paper picks the best checkpoint (§5.1), so merge and evaluate each one. GPU memory has not been measured. If you run out, lower `--max_length` (default 8192) or `--global_max_image_tokens`.
+
 ## Repository layout
 
 ```
@@ -108,6 +139,14 @@ scripts/download.sh             model weights and V* data
 scripts/run_vstar.sh            judge check -> VLMEvalKit inference + evaluation -> summary
 scripts/check_judge.py          fails fast if the judge API does not answer
 scripts/summarize_vstar.py      Attribute / Spatial / Overall vs. the paper, plus sanity warnings
-tests/                          offline tests (pytest): summary logic, plus VLMEvalKit's own V* prompt
-                                and scoring code on synthetic outputs (runs when vlmeval is installed)
+scripts/download_data.sh        CapImagine-Data and the Qwen2.5-VL-7B-Instruct base model
+scripts/train_lora.sh           torchrun launcher with the paper's global batch size
+train/data.py                   CapImagine-Data records -> Qwen2.5-VL chat messages
+train/collator.py               tokenization, Monet's image budget, assistant-only labels
+train/train_lora.py             PEFT LoRA + HF Trainer, with a gradient-accumulation-safe loss
+train/merge_lora.py             merges an adapter into a standalone model for evaluation
+train/inspect_data.py           schema and image-path check of the dataset, no GPU needed
+tests/                          offline tests (pytest): summary logic; VLMEvalKit's own V* prompt and
+                                scoring code on synthetic outputs; LoRA training, label masking and
+                                merging on a tiny random Qwen2.5-VL (CPU)
 ```
