@@ -113,20 +113,23 @@ def find_result_file(work_dir, model_name, judge):
     return files[-1]
 
 
-def format_report(summary, model_name, result_file, judge):
-    paper = PAPER.get(model_name)
+def format_report(summary, model_name, result_file, judge, reference=None):
+    reference = reference or model_name
+    paper = PAPER.get(reference)
     run_dir = os.path.basename(os.path.dirname(result_file))
+    paper_col = 'paper' if reference == model_name else f'paper ({reference})'
     lines = [
         f'V* Bench | {model_name} | judge: {judge} | run: {run_dir}',
         f'result file: {result_file}',
         '',
-        '| Split | n | correct | ours | paper | diff | boxed-only (diagnostic) |',
+        f'| Split | n | correct | ours | {paper_col} | diff | boxed-only (diagnostic) |',
         '|---|---|---|---|---|---|---|',
     ]
     for name in SPLITS:
         s = summary['splits'][name]
         ref = f'{paper[name]:.1f}' if paper else '-'
-        diff = f'{s["acc"] - paper[name]:+.1f}' if paper else '-'
+        # Diff of the displayed (rounded) values, so 85.86 vs 85.9 reads +0.0 rather than -0.0.
+        diff = f'{round(s["acc"], 1) - paper[name]:+.1f}' if paper else '-'
         lines.append(
             f'| {name} | {s["n"]} | {s["correct"]} | {s["acc"]:.1f} | {ref} | {diff} | {s["boxed_acc"]:.1f} |'
         )
@@ -158,14 +161,16 @@ def main(argv=None):
     parser.add_argument('--model-name', default='CapImagine-7B')
     parser.add_argument('--judge', default='chatgpt-0125')
     parser.add_argument('--result-file', help='explicit *_result.xlsx (skips the search in --work-dir)')
+    parser.add_argument('--reference', help=f'paper row to compare with (default: --model-name); one of {list(PAPER)}')
     args = parser.parse_args(argv)
+    reference = args.reference or args.model_name
 
     result_file = args.result_file or find_result_file(args.work_dir, args.model_name, args.judge)
     summary = summarize(pd.read_excel(result_file))
-    print(format_report(summary, args.model_name, result_file, args.judge))
+    print(format_report(summary, args.model_name, result_file, args.judge, reference))
 
-    summary.update(model=args.model_name, judge=args.judge, result_file=result_file,
-                   paper=PAPER.get(args.model_name))
+    summary.update(model=args.model_name, judge=args.judge, result_file=result_file, reference=reference,
+                   paper=PAPER.get(reference))
     out = os.path.splitext(result_file)[0] + '_summary.json'
     with open(out, 'w') as f:
         json.dump(summary, f, indent=2)

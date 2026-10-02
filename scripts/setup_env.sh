@@ -30,6 +30,8 @@ fi
 PINS=("vllm==0.10.0" "transformers==4.54.0" "qwen-vl-utils==0.0.11")
 
 pip install "${PINS[@]}" accelerate
+# LoRA fine-tuning (train/); 0.17.1 was released alongside transformers 4.54.
+pip install "peft==0.17.1"
 if [ "${SKIP_FLASH_ATTN:-0}" != 1 ]; then
   # VLMEvalKit's transformers backend for Qwen2.5-VL hard-codes flash_attention_2.
   pip install "flash-attn==2.8.2" --no-build-isolation
@@ -52,7 +54,7 @@ python -c "import vlmeval" 2>/dev/null || { python -c "import vlmeval"; echo "im
 
 python - <<'EOF'
 import importlib.metadata as md
-for pkg in ["torch", "transformers", "vllm", "qwen-vl-utils", "flash-attn", "vlmeval"]:
+for pkg in ["torch", "transformers", "vllm", "qwen-vl-utils", "flash-attn", "peft", "vlmeval"]:
     try:
         print(f"{pkg:15s} {md.version(pkg)}")
     except md.PackageNotFoundError:

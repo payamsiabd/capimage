@@ -89,6 +89,16 @@ def test_main_finds_latest_vlmevalkit_result(tmp_path):
         assert json.load(f)['splits']['Spatial']['correct'] == 63
 
 
+def test_custom_model_compares_against_reference(tmp_path):
+    run_dir = tmp_path / 'my-lora' / 'T20261002_G0bac5c06'
+    run_dir.mkdir(parents=True)
+    make_results().to_excel(run_dir / 'my-lora_VStarBench_openai_result.xlsx', index=False)
+    summary = sv.main(['--work-dir', str(tmp_path), '--model-name', 'my-lora', '--reference', 'CapImagine-7B'])
+    assert summary['paper'] == sv.PAPER['CapImagine-7B']
+    report = sv.format_report(summary, 'my-lora', summary['result_file'], 'chatgpt-0125', 'CapImagine-7B')
+    assert 'paper (CapImagine-7B)' in report and '| Overall | 191 | 164 | 85.9 | 85.9 | +0.0 |' in report
+
+
 def test_main_exits_when_no_result(tmp_path):
     with pytest.raises(SystemExit):
         sv.main(['--work-dir', str(tmp_path)])
