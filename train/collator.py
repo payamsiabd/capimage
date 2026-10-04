@@ -2,7 +2,8 @@
 
 Loss is computed on assistant turns only: each assistant reply and its closing
 ``<|im_end|>`` are supervised; the system prompt, the question, image tokens and padding
-are masked with -100.
+are masked with -100. With `goldfish_k` set, the goldfish loss (train/goldfish.py) also
+drops about 1 in k of the supervised tokens, chosen by a hash of the local text.
 """
 import logging
 import math
@@ -10,6 +11,8 @@ import math
 import torch
 from PIL import Image
 from qwen_vl_utils import process_vision_info
+
+from train.goldfish import apply_goldfish
 
 IGNORE_INDEX = -100
 VISION_TOKENS = ('<|vision_start|>', '<|vision_end|>', '<|image_pad|>', '<|video_pad|>')
@@ -43,11 +46,14 @@ def resize_by_token_budget(images, global_max_pixels=2000 * 28 * 28, per_img_max
 
 
 class QwenVLSFTCollator:
-    def __init__(self, processor, max_length=8192, global_max_image_tokens=2000, per_image_max_tokens=1280):
+    def __init__(self, processor, max_length=8192, global_max_image_tokens=2000, per_image_max_tokens=1280,
+                 goldfish_k=None, goldfish_context_width=13):
         self.processor = processor
         self.max_length = max_length
         self.global_max_pixels = global_max_image_tokens * 28 * 28
         self.per_image_max_pixels = per_image_max_tokens * 28 * 28
+        self.goldfish_k = goldfish_k
+        self.goldfish_context_width = goldfish_context_width
 
         tok = processor.tokenizer
         # Truncation to max_length below cuts the batch's tail, which only drops padding when padding is on the right.
@@ -90,6 +96,11 @@ class QwenVLSFTCollator:
                 images.extend(resize_by_token_budget(sample_images, self.global_max_pixels, self.per_image_max_pixels))
         enc = self.processor(text=texts, images=images or None, return_tensors='pt', padding=True)
         enc['labels'] = self.build_labels(enc['input_ids'], enc['attention_mask'])
+        if self.goldfish_k:
+            # Dropping targets here (not in the loss) lets Trainer's token count, and so the loss
+            # normalisation, cover only the kept tokens: Eq. 2 of the paper over the whole step.
+            enc['labels'] = apply_goldfish(enc['labels'], enc['input_ids'], self.goldfish_k,
+                                           self.goldfish_context_width, IGNORE_INDEX)
 
         if enc['input_ids'].shape[1] > self.max_length:
             tail = enc['input_ids'][:, self.max_length:]

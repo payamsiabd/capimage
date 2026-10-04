@@ -165,3 +165,45 @@ def test_train_merge_end_to_end(workspace, tmp_path):
         merged_logits = Qwen2_5_VLForConditionalGeneration.from_pretrained(merged_dir).eval()(**inputs).logits
     assert not torch.allclose(base_logits, peft_logits, atol=1e-4), 'adapter had no effect'
     torch.testing.assert_close(merged_logits, peft_logits, atol=1e-4, rtol=1e-4)
+
+
+def test_goldfish_collator_drops_a_content_determined_subset(workspace):
+    from transformers import AutoProcessor
+    root, model_dir = workspace
+    processor = AutoProcessor.from_pretrained(model_dir)
+    dataset = CapImagineDataset([str(root / 'train.json')], str(root))
+    samples = [dataset[0], dataset[1]]  # same reply, different image sizes (so different offsets)
+    standard = QwenVLSFTCollator(processor)(samples)
+    goldfish = QwenVLSFTCollator(processor, goldfish_k=2, goldfish_context_width=4)(samples)
+
+    assert torch.equal(goldfish['input_ids'], standard['input_ids'])
+    sup, kept = standard['labels'] != IGNORE_INDEX, goldfish['labels'] != IGNORE_INDEX
+    assert (kept <= sup).all() and torch.equal(goldfish['labels'][kept], standard['labels'][kept])
+    patterns = [kept[row][sup[row]] for row in range(2)]  # kept/dropped along each reply
+    assert 0 < patterns[0].sum() < len(patterns[0])
+    assert torch.equal(patterns[0], patterns[1])  # the same reply is masked the same way
+
+
+def test_goldfish_training_runs(workspace, tmp_path):
+    from train.train_lora import main
+    root, model_dir = workspace
+    trainer = main([
+        '--model_name_or_path', model_dir, '--data_path', str(root / 'train.json'), '--output_dir', str(tmp_path),
+        '--attn_implementation', 'sdpa', '--bf16', 'False', '--max_steps', '2', '--gradient_accumulation_steps', '2',
+        '--dataloader_num_workers', '0', '--save_strategy', 'no', '--lora_r', '8', '--lora_alpha', '16',
+        '--goldfish_strategy', 'hash-table', '--k_goldfish', '2', '--goldfish_context_width', '4'])
+    assert trainer.data_collator.goldfish_k == 2 and trainer.data_collator.goldfish_context_width == 4
+    losses = [h['loss'] for h in trainer.state.log_history if 'loss' in h]
+    vocab = trainer.model.get_base_model().config.vocab_size
+    # Mean over kept tokens (Eq. 2): still ~ln(vocab) for a random model, not scaled by the drop rate.
+    assert len(losses) == 2 and abs(losses[0] - torch.log(torch.tensor(float(vocab)))) < 0.5, losses
+
+
+@pytest.mark.parametrize('flags', [['--goldfish_strategy', 'static'], ['--goldfish_strategy', 'hash-table',
+                                                                       '--k_goldfish', '1']])
+def test_goldfish_rejects_unsupported_settings(workspace, tmp_path, flags):
+    from train.train_lora import main
+    root, model_dir = workspace
+    with pytest.raises(SystemExit):
+        main(['--model_name_or_path', model_dir, '--data_path', str(root / 'train.json'),
+              '--output_dir', str(tmp_path), '--bf16', 'False'] + flags)
