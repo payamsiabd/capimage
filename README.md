@@ -129,6 +129,33 @@ MODEL=custom MODEL_PATH=checkpoints/capimagine-lora-merged bash scripts/run_vsta
 
 `train_lora.sh` takes `DATA`, `IMAGE_ROOT`, `BASE_MODEL`, `OUTPUT_DIR`, `NGPU` and `GLOBAL_BATCH` as env vars. Any extra arguments go to `train.train_lora`, which also accepts every `transformers.TrainingArguments` flag, e.g. `--num_train_epochs 2 --report_to wandb`. An adapter is saved after each epoch in `checkpoint-*`. The paper picks the best checkpoint (§5.1), so merge and evaluate each one. GPU memory has not been measured. If you run out, lower `--max_length` (default 8192) or `--global_max_image_tokens`.
 
+### Goldfish-loss variant
+
+`scripts/train_lora_goldfish.sh` runs the same LoRA training with one change: the standard next-token loss is replaced by the **goldfish loss** from *Be like a Goldfish, Don't Memorize!* (Hans et al., NeurIPS 2024; [ahans30/goldfish-loss](https://github.com/ahans30/goldfish-loss)). The loss skips a pseudo-random ~1 in k of the supervised tokens, and the choice depends only on the surrounding text, so the model can't learn to reproduce training replies verbatim. Every other setting matches the standard run.
+
+```bash
+bash scripts/train_lora_goldfish.sh          # adapters -> checkpoints/capimagine-lora-goldfish
+python -m train.merge_lora --adapter checkpoints/capimagine-lora-goldfish --output checkpoints/capimagine-lora-goldfish-merged
+MODEL=custom MODEL_PATH=checkpoints/capimagine-lora-goldfish-merged bash scripts/run_vstar.sh
+```
+
+| Setting | Value | Source |
+|---|---|---|
+| Mask | `hash-table`: multiply the token ids of the `h` targets ending at each target (that target included), look the product up in a fixed random table (1,000,003 entries, seed 2971215073), and drop the target if the value is < 1/k. The first `h−1` targets of a sequence are never dropped. | `apply_goldfish` in the official `lit_gpt/utils.py`, the strategy behind the paper's main results |
+| k (drop 1 in k) | 4 (`K_GOLDFISH`) | Paper default; released config |
+| h (context width) | 13 (`GOLDFISH_H`) | Paper §3.1; released config `tinyllama-1b-equal-supervised-tokens.yaml` |
+| Normalization | Mean over the kept tokens (paper Eq. 2), across the whole optimizer step and all GPUs | Paper Eq. 2 |
+| Scope | Only assistant tokens are supervised to begin with. The hash still reads the true token ids, prompt included, so the start of a reply is masked by its actual context. | Adaptation to chat SFT; the reference hashes raw next tokens |
+
+The flags are also available directly: `--goldfish_strategy hash-table --k_goldfish 4 --goldfish_context_width 13`. The mask is applied to the labels in the collator, so Trainer's token count already excludes dropped tokens; this is what makes the normalization exactly Eq. 2. The training log reports how many tokens of the first example were dropped.
+
+**Fidelity notes.**
+- On CPU the mask is bit-identical to the reference code: `tests/test_goldfish.py` runs a verbatim copy of it.
+- The reference builds its random table on the training device. Here it's built on CPU, so every machine masks identically, but the values differ from the reference's CUDA table. The drop rule and the 1-in-k rate are the same.
+- Two quirks of the reference's product hash are kept on purpose. The key ignores token order, and any window containing token id 0 (`!` in Qwen's vocabulary) gets key 0. With this table, `table[0] = 0.234 < 1/4`, so at k=4 the 13 targets starting at each `!` are always dropped.
+
+**Fewer supervised tokens.** k=4 drops about 25% of the supervised tokens. The paper (§5.2) recovers the standard loss's quality by training on proportionally more tokens: a k/(k−1) larger batch, or more steps. That isn't applied here, so the comparison stays a single change. To try it, set `GLOBAL_BATCH=168` on 8 GPUs (≈ 128 × 4/3, rounded to a multiple of 8).
+
 ## Repository layout
 
 ```
@@ -141,12 +168,15 @@ scripts/check_judge.py          fails fast if the judge API does not answer
 scripts/summarize_vstar.py      Attribute / Spatial / Overall vs. the paper, plus sanity warnings
 scripts/download_data.sh        CapImagine-Data and the Qwen2.5-VL-7B-Instruct base model
 scripts/train_lora.sh           torchrun launcher with the paper's global batch size
+scripts/train_lora_goldfish.sh  the same run with the goldfish loss (k=4, h=13)
 train/data.py                   CapImagine-Data records -> Qwen2.5-VL chat messages
 train/collator.py               tokenization, Monet's image budget, assistant-only labels
 train/train_lora.py             PEFT LoRA + HF Trainer, with a gradient-accumulation-safe loss
+train/goldfish.py               goldfish-loss token mask, ported from the official implementation
 train/merge_lora.py             merges an adapter into a standalone model for evaluation
 train/inspect_data.py           schema and image-path check of the dataset, no GPU needed
 tests/                          offline tests (pytest): summary logic; VLMEvalKit's own V* prompt and
                                 scoring code on synthetic outputs; LoRA training, label masking and
-                                merging on a tiny random Qwen2.5-VL (CPU)
+                                merging on a tiny random Qwen2.5-VL (CPU); goldfish mask vs. a verbatim
+                                copy of the official code
 ```

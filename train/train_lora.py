@@ -11,6 +11,9 @@ of the language model) are the usual LoRA counterparts, not values from the pape
         --data_path data/CapImagine-Data/<file>.json --image_root data/CapImagine-Data \
         --output_dir checkpoints/capimagine-lora
 
+Add `--goldfish_strategy hash-table --k_goldfish 4 --goldfish_context_width 13` to train with
+the goldfish loss (train/goldfish.py) instead of the standard next-token loss.
+
 Every `transformers.TrainingArguments` flag is accepted as well.
 """
 import logging
@@ -26,6 +29,7 @@ from transformers.trainer_utils import SaveStrategy
 
 from train.collator import IGNORE_INDEX, QwenVLSFTCollator
 from train.data import MONET_SYSTEM_PROMPT, CapImagineDataset
+from train.goldfish import STRATEGIES as GOLDFISH_STRATEGIES
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +64,14 @@ class LoraArguments:
     lora_alpha: int = 128
     lora_dropout: float = 0.05
     lora_target_modules: str = field(default=LLM_LINEAR_REGEX, metadata={'help': 'regex over module names'})
+
+
+@dataclass
+class GoldfishArguments:
+    """Goldfish loss (Hans et al., NeurIPS 2024). Flag names and the h=13 default follow the official repo's config."""
+    goldfish_strategy: Optional[str] = field(default=None, metadata={'help': "unset = standard loss; 'hash-table'"})
+    k_goldfish: int = field(default=4, metadata={'help': 'drop about 1 in k supervised tokens'})
+    goldfish_context_width: int = field(default=13, metadata={'help': 'tokens hashed per drop decision (h)'})
 
 
 @dataclass
@@ -121,13 +133,23 @@ def log_example(dataset, collator, tokenizer):
     supervised = tokenizer.decode(batch['input_ids'][0][labels != IGNORE_INDEX])
     logger.info('Example 0: %d tokens, %d supervised. Supervised text:\n%s',
                 batch['input_ids'].shape[1], int((labels != IGNORE_INDEX).sum()), supervised[:2000])
+    if collator.goldfish_k:
+        standard = collator.build_labels(batch['input_ids'], batch['attention_mask'])[0]
+        n_standard, n_kept = int((standard != IGNORE_INDEX).sum()), int((labels != IGNORE_INDEX).sum())
+        logger.info('Goldfish loss (k=%d, h=%d) drops %d of %d supervised tokens in example 0 (about 1/k expected).',
+                    collator.goldfish_k, collator.goldfish_context_width, n_standard - n_kept, n_standard)
 
 
 def main(argv=None):
-    parser = HfArgumentParser((ModelArguments, DataArguments, LoraArguments, TrainArguments))
-    model_args, data_args, lora_args, train_args = parser.parse_args_into_dataclasses(args=argv)
+    parser = HfArgumentParser((ModelArguments, DataArguments, LoraArguments, GoldfishArguments, TrainArguments))
+    model_args, data_args, lora_args, goldfish_args, train_args = parser.parse_args_into_dataclasses(args=argv)
     if not data_args.data_path or not train_args.output_dir:
         parser.error('--data_path and --output_dir are required')
+    if goldfish_args.goldfish_strategy is not None:
+        if goldfish_args.goldfish_strategy not in GOLDFISH_STRATEGIES:
+            parser.error(f'--goldfish_strategy must be one of {GOLDFISH_STRATEGIES}')
+        if goldfish_args.k_goldfish < 2 or goldfish_args.goldfish_context_width < 1:
+            parser.error('--k_goldfish must be >= 2 and --goldfish_context_width >= 1')
     if train_args.gradient_checkpointing and train_args.gradient_checkpointing_kwargs is None:
         train_args.gradient_checkpointing_kwargs = {'use_reentrant': False}
     logging.basicConfig(level=logging.INFO if train_args.local_rank in (-1, 0) else logging.WARNING,
@@ -144,7 +166,9 @@ def main(argv=None):
     logger.info('Loaded %d training samples (image root: %s)', len(dataset), image_root)
 
     collator = QwenVLSFTCollator(processor, data_args.max_length, data_args.global_max_image_tokens,
-                                 data_args.per_image_max_tokens)
+                                 data_args.per_image_max_tokens,
+                                 goldfish_k=goldfish_args.k_goldfish if goldfish_args.goldfish_strategy else None,
+                                 goldfish_context_width=goldfish_args.goldfish_context_width)
     if train_args.local_rank in (-1, 0):
         log_example(dataset, collator, processor.tokenizer)
 
