@@ -167,23 +167,26 @@ tokens ─────┤                                                       
             └─ personalised branch: same LM, LoRA on ───────── h_personal ┘
 ```
 
-`h_general` and `h_personal` are the final (post-norm) hidden states, i.e. the representation `lm_head` normally reads. `w` is the personalized branch's weight: learnable and initialized to **0.1** (so 0.9 general, 0.1 personalized). Training computes the loss on the fused logits. Inference generates every token from them too, with one KV cache per branch. Everything else matches the standard LoRA run.
+`h_general` and `h_personal` are the final (post-norm) hidden states, i.e. the representation `lm_head` normally reads. `w` is the personalized branch's weight. It starts at **0.1** (so 0.9 general, 0.1 personalized), and you choose whether it is **learned** or **fixed**. Training computes the loss on the fused logits. Inference generates every token from them too, with one KV cache per branch. Everything else matches the standard LoRA run.
 
 ```bash
-bash scripts/train_lora_dual.sh                    # adapters + w -> checkpoints/capimagine-lora-dual
-MODEL=dual ADAPTER_PATH=checkpoints/capimagine-lora-dual bash scripts/run_vstar.sh
+bash scripts/train_lora_dual.sh                    # learnable w (default); adapters + w -> checkpoints/capimagine-lora-dual
+PERSONALIZATION_TRAINABLE=false OUTPUT_DIR=checkpoints/capimagine-lora-dual-fixed \
+  bash scripts/train_lora_dual.sh                  # w fixed at 0.1 for the whole run
+MODEL=dual ADAPTER_PATH=checkpoints/capimagine-lora-dual bash scripts/run_vstar.sh   # same for the -fixed adapter
 ```
 
 | Setting | Value | Why |
 |---|---|---|
 | Fusion | `(1 − w)·h_general + w·h_personal`, with `w = sigmoid(θ)` | The sigmoid keeps the two weights non-negative and summing to 1, so the fusion stays a weighted average. |
-| Initial `w` | 0.1 (`PERSONALIZATION_INIT`) | As specified |
-| Learning rate of `w` | 1e-2 (`PERSONALIZATION_LR`; `0` keeps `w` fixed) | Adam moves a scalar by about its learning rate per step. At the LoRA rate (1e-4), `w` could change by only ~0.005 over the whole run. |
+| Initial `w` | 0.1 (`PERSONALIZATION_INIT`) | As specified. With a fixed `w`, this is the value used throughout. |
+| Learned or fixed | Learned (`PERSONALIZATION_TRAINABLE=true`, the default) or fixed (`false`; flag `--personalization_trainable`) | A fixed `w` is stored as a buffer: it gets no gradient and no optimizer slot, but it is still saved with the adapter. |
+| Learning rate of `w` | 1e-2 (`PERSONALIZATION_LR`; only used when `w` is learned) | Adam moves a scalar by about its learning rate per step. At the LoRA rate (1e-4), `w` could change by only ~0.005 over the whole run. |
 | Weight decay on `w` | none | Decay would pull θ toward 0, i.e. `w` toward 0.5. |
 | General branch | Frozen, run under `torch.no_grad()` | It has no trainable parameters, so it costs one extra forward pass but no activation memory. |
 | Vision tower | Shared | It has no adapters, so both branches see identical image features. |
 
-`w` is saved with the adapter (PEFT `modules_to_save`) and printed in the training log as `personalization_weight`. The LoRA weights start at zero, so both branches agree at first and `w` only starts moving once LoRA does.
+`w` is saved with the adapter (PEFT `modules_to_save`) in both modes, so evaluation and inference use exactly the value trained with. It's printed in the training log as `personalization_weight`. When `w` is learned, it only starts moving once LoRA does: the LoRA weights start at zero, so at first both branches agree.
 
 **What it costs.**
 - Training does one extra forward pass per step (about 1.3× compute, no extra activation memory).
@@ -203,7 +206,7 @@ Using it from Python:
 from train.dual_branch import load_dual_branch, personalization_weight
 model = load_dual_branch('models/Qwen2.5-VL-7B-Instruct', 'checkpoints/capimagine-lora-dual',
                          torch_dtype='bfloat16', device_map='auto')
-print(personalization_weight(model))      # the learned w
+print(personalization_weight(model))      # the trained (or fixed) w
 output_ids = model.generate(**inputs)     # inputs from the Qwen2.5-VL processor; every token from the fused representation
 ```
 

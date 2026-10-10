@@ -15,7 +15,8 @@ Add `--goldfish_strategy hash-table --k_goldfish 4 --goldfish_context_width 13` 
 the goldfish loss (train/goldfish.py) instead of the standard next-token loss.
 
 Add `--dual_branch True` to train the dual-branch model (train/dual_branch.py): the loss is computed
-on the fused representation (1 - w) * general + w * personalised, with w learnable from 0.1.
+on the fused representation (1 - w) * general + w * personalised, with w = 0.1 at the start and either
+learned (default) or kept fixed with `--personalization_trainable False`.
 
 Every `transformers.TrainingArguments` flag is accepted as well.
 """
@@ -81,9 +82,12 @@ class GoldfishArguments:
 @dataclass
 class DualBranchArguments:
     dual_branch: bool = field(default=False, metadata={'help': 'fuse a frozen general branch with the LoRA branch'})
-    personalization_init: float = field(default=0.1, metadata={'help': 'initial weight w of the LoRA branch'})
-    personalization_lr: float = field(default=1e-2, metadata={'help': 'learning rate of w (0 keeps it fixed). '
-                                      'Adam moves a scalar by about lr per step, so at the LoRA lr w would barely move'})
+    personalization_init: float = field(default=0.1,
+                                        metadata={'help': 'initial (or fixed) weight w of the LoRA branch'})
+    personalization_trainable: bool = field(default=True, metadata={'help': 'learn w (True) or keep it fixed at '
+                                                                            '--personalization_init (False)'})
+    personalization_lr: float = field(default=1e-2, metadata={'help': 'learning rate of a trainable w. Adam moves a '
+                                      'scalar by about lr per step, so at the LoRA lr w would barely move'})
 
 
 @dataclass
@@ -156,7 +160,7 @@ def build_model(model_args, lora_args, train_args, dual_args):
     if train_args.gradient_checkpointing:
         model.enable_input_require_grads()
     if dual_args.dual_branch:
-        model = to_dual_branch(model, dual_args.personalization_init)
+        model = to_dual_branch(model, dual_args.personalization_init, dual_args.personalization_trainable)
 
     lora_config = LoraConfig(r=lora_args.lora_r, lora_alpha=lora_args.lora_alpha, lora_dropout=lora_args.lora_dropout,
                              target_modules=lora_args.lora_target_modules, bias='none', task_type='CAUSAL_LM',

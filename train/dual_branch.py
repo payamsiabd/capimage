@@ -5,7 +5,7 @@ on the same inputs:
 
     h_general  = final hidden state with the LoRA adapters disabled (the pretrained model)
     h_personal = final hidden state with the LoRA adapters enabled
-    h          = (1 - w) * h_general + w * h_personal        w = sigmoid(logit), learnable, init 0.1
+    h          = (1 - w) * h_general + w * h_personal        w = sigmoid(logit), init 0.1, learnable or fixed
     logits     = lm_head(h)
 
 The loss and the next token both come from the fused logits. The general branch has no
@@ -36,13 +36,21 @@ GATE_MODULE = 'personalization_gate'
 
 
 class PersonalizationGate(torch.nn.Module):
-    """Weighted average of the two branches; the personalised weight is sigmoid(logit)."""
+    """Weighted average of the two branches; the personalised weight is sigmoid(logit).
 
-    def __init__(self, init_weight=0.1):
+    trainable=False stores the logit as a buffer: it never gets a gradient or an optimizer slot,
+    but it is still saved with the adapter under the same key, so inference uses the chosen value.
+    """
+
+    def __init__(self, init_weight=0.1, trainable=True):
         super().__init__()
         if not 0 < init_weight < 1:
             raise ValueError(f'personalisation weight must be in (0, 1), got {init_weight}')
-        self.logit = torch.nn.Parameter(torch.tensor(math.log(init_weight / (1 - init_weight))))
+        logit = torch.tensor(math.log(init_weight / (1 - init_weight)))
+        if trainable:
+            self.logit = torch.nn.Parameter(logit)
+        else:
+            self.register_buffer('logit', logit)
 
     @property
     def weight(self):
@@ -130,21 +138,24 @@ class DualBranchQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGener
             hidden_states=personal.hidden_states, attentions=personal.attentions, rope_deltas=personal.rope_deltas)
 
 
-def to_dual_branch(model, init_weight=0.1):
-    """Turn a loaded Qwen2.5-VL into the dual-branch model in place (weights, devices and hooks are kept)."""
+def to_dual_branch(model, init_weight=0.1, trainable=True):
+    """Turn a loaded Qwen2.5-VL into the dual-branch model in place (weights, devices and hooks are kept).
+
+    `trainable` chooses between a learnable personalised weight and one fixed at `init_weight`.
+    """
     if isinstance(model, DualBranchQwen2_5_VLForConditionalGeneration):
         return model
     if type(model) is not Qwen2_5_VLForConditionalGeneration:
         raise TypeError(f'expected Qwen2_5_VLForConditionalGeneration, got {type(model).__name__}')
     model.__class__ = DualBranchQwen2_5_VLForConditionalGeneration
-    model.add_module(GATE_MODULE, PersonalizationGate(init_weight).to(model.lm_head.weight.device))
+    model.add_module(GATE_MODULE, PersonalizationGate(init_weight, trainable).to(model.lm_head.weight.device))
     return model
 
 
 def personalization_weight(model):
     """Current personalised weight w of a (possibly PEFT-wrapped) dual-branch model."""
     gate = next(m for name, m in model.named_modules() if name.split('.')[-1] == GATE_MODULE)
-    device = next(gate.parameters()).device
+    device = next(iter(gate.state_dict().values())).device  # the logit is a parameter or, if fixed, a buffer
     with torch.no_grad():  # calling the gate lets a PEFT wrapper route to its trained copy
         return gate(torch.zeros(1, device=device), torch.ones(1, device=device)).item()
 

@@ -70,6 +70,17 @@ def test_gate_is_a_weighted_average_starting_at_one_tenth():
         PersonalizationGate(1.0)
 
 
+def test_fixed_gate_has_no_parameters_but_keeps_its_value_in_the_state_dict():
+    gate = PersonalizationGate(0.1, trainable=False)
+    assert list(gate.parameters()) == [] and list(gate.state_dict()) == ['logit']
+    assert gate.weight.item() == pytest.approx(0.1, abs=1e-6)
+    general, personal = torch.randn(2, 3, 5), torch.randn(2, 3, 5)
+    torch.testing.assert_close(gate(general, personal), 0.9 * general + 0.1 * personal)
+    trainable = PersonalizationGate(0.5)
+    trainable.load_state_dict(gate.state_dict())  # same key either way, so adapters load in both modes
+    assert trainable.weight.item() == pytest.approx(0.1, abs=1e-6)
+
+
 def test_logits_come_from_the_fused_final_representations(workspace):
     _, model_dir, batch, _ = workspace
     model = dual_model(model_dir)
@@ -177,3 +188,29 @@ def test_training_learns_the_weight_and_the_adapter_reloads(workspace, tmp_path)
         torch.testing.assert_close(reloaded(**batch).logits, trainer.model.eval()(**batch).logits)
     with pytest.raises(ValueError, match='dual-branch'):
         merge(str(out), str(tmp_path / 'merged'), base=model_dir)
+
+
+def test_training_with_a_fixed_weight(workspace, tmp_path):
+    from train.train_lora import main
+    root, model_dir, batch, _ = workspace
+    out = tmp_path / 'dual-fixed'
+    trainer = main([
+        '--model_name_or_path', model_dir, '--data_path', str(root / 'train.json'), '--output_dir', str(out),
+        '--attn_implementation', 'sdpa', '--bf16', 'False', '--max_steps', '4', '--gradient_accumulation_steps', '1',
+        '--learning_rate', '1e-2', '--lr_scheduler_type', 'constant', '--warmup_steps', '0',
+        '--dataloader_num_workers', '0', '--save_strategy', 'no', '--lora_r', '8', '--lora_alpha', '16',
+        '--dual_branch', 'True', '--personalization_init', '0.25', '--personalization_trainable', 'False',
+        '--personalization_lr', '0.05'])
+
+    weights = [h['personalization_weight'] for h in trainer.state.log_history if 'personalization_weight' in h]
+    assert len(weights) >= 4 and all(w == pytest.approx(0.25, abs=1e-6) for w in weights), weights  # steps + summary
+    trainable = [n for n, p in trainer.model.named_parameters() if p.requires_grad]
+    assert trainable and all('lora_' in n for n in trainable)  # only LoRA trains; w is not a parameter
+    optimized = sum(len(g['params']) for g in trainer.optimizer.param_groups)
+    assert optimized == len(trainable)
+    assert any(p.abs().sum() > 0 for n, p in trainer.model.named_parameters() if 'lora_B' in n)  # LoRA did train
+
+    reloaded = load_dual_branch(model_dir, str(out))  # builds a 0.1 gate, then loads the saved 0.25
+    assert personalization_weight(reloaded) == pytest.approx(0.25, abs=1e-6)
+    with torch.no_grad():
+        torch.testing.assert_close(reloaded(**batch).logits, trainer.model.eval()(**batch).logits)
