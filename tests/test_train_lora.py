@@ -33,13 +33,6 @@ def monet_record(image):
     ], 'metadata': {'source': 'Visual_CoT'}}
 
 
-@pytest.fixture(autouse=True)
-def grad_enabled():
-    # Importing vlmeval (tests/test_vlmevalkit_integration.py) runs torch.set_grad_enabled(False) globally.
-    with torch.enable_grad():
-        yield
-
-
 @pytest.fixture(scope='module')
 def workspace(tmp_path_factory):
     root = tmp_path_factory.mktemp('capimagine')

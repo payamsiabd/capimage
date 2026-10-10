@@ -59,11 +59,12 @@ bash scripts/run_vstar.sh          # inference + judge + comparison with the pap
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `MODEL` | `capimagine` | `qwen25vl` evaluates the Qwen2.5-VL-7B base model to sanity-check the pipeline (download it with `WITH_BASELINE=1 bash scripts/download.sh`). `custom` evaluates your own merged fine-tune at `MODEL_PATH` (see [LoRA fine-tuning](#lora-fine-tuning-on-capimagine-data)). |
-| `MODEL_NAME` | basename of `MODEL_PATH` | Output name for `MODEL=custom` |
+| `MODEL` | `capimagine` | `qwen25vl` evaluates the Qwen2.5-VL-7B base model to sanity-check the pipeline (download it with `WITH_BASELINE=1 bash scripts/download.sh`). `custom` evaluates your own merged fine-tune at `MODEL_PATH` (see [LoRA fine-tuning](#lora-fine-tuning-on-capimagine-data)). `dual` evaluates a dual-branch adapter at `ADAPTER_PATH` on top of the base model at `MODEL_PATH` (see [Dual-branch variant](#dual-branch-variant)). |
+| `ADAPTER_PATH` | (none) | Dual-branch adapter dir, for `MODEL=dual` |
+| `MODEL_NAME` | basename of `MODEL_PATH` (or `ADAPTER_PATH`) | Output name for `MODEL=custom` / `dual` |
 | `REFERENCE` | `CapImagine-7B` for `custom` | Which paper row the summary compares against |
 | `JUDGE` | `chatgpt-0125` | Any VLMEvalKit judge name, e.g. `gpt-4o-mini`. `exact_matching` turns the LLM judge off (not the paper protocol). |
-| `USE_VLLM` | `0` | `1` uses VLMEvalKit's vLLM backend (faster; doesn't need flash-attn) |
+| `USE_VLLM` | `0` | `1` uses VLMEvalKit's vLLM backend (faster; doesn't need flash-attn). Not available for `MODEL=dual`. |
 | `NGPU` | `1` | Number of data-parallel processes for the transformers backend (uses `torchrun`) |
 | `MODE` | `all` | `infer` generates predictions only. `eval` re-scores existing predictions, e.g. with a different `JUDGE`. |
 | `REUSE` | `1` for `MODE=eval`, else `0` | `1` reuses the latest earlier predictions (VLMEvalKit `--reuse`). Without it, VLMEvalKit moves earlier outputs from the same day into `bak_*` and starts over. |
@@ -156,6 +157,56 @@ The flags are also available directly: `--goldfish_strategy hash-table --k_goldf
 
 **Fewer supervised tokens.** k=4 drops about 25% of the supervised tokens. The paper (§5.2) recovers the standard loss's quality by training on proportionally more tokens: a k/(k−1) larger batch, or more steps. That isn't applied here, so the comparison stays a single change. To try it, set `GLOBAL_BATCH=168` on 8 GPUs (≈ 128 × 4/3, rounded to a multiple of 8).
 
+### Dual-branch variant
+
+`scripts/train_lora_dual.sh` trains the language model as two branches that are fused for every token:
+
+```
+            ┌─ general branch:      pretrained LM, LoRA off ── h_general ─┐
+tokens ─────┤                                                             ├─ (1 − w)·h_general + w·h_personal ─ lm_head ─ next token
+            └─ personalised branch: same LM, LoRA on ───────── h_personal ┘
+```
+
+`h_general` and `h_personal` are the final (post-norm) hidden states, i.e. the representation `lm_head` normally reads. `w` is the personalized branch's weight: learnable and initialized to **0.1** (so 0.9 general, 0.1 personalized). Training computes the loss on the fused logits. Inference generates every token from them too, with one KV cache per branch. Everything else matches the standard LoRA run.
+
+```bash
+bash scripts/train_lora_dual.sh                    # adapters + w -> checkpoints/capimagine-lora-dual
+MODEL=dual ADAPTER_PATH=checkpoints/capimagine-lora-dual bash scripts/run_vstar.sh
+```
+
+| Setting | Value | Why |
+|---|---|---|
+| Fusion | `(1 − w)·h_general + w·h_personal`, with `w = sigmoid(θ)` | The sigmoid keeps the two weights non-negative and summing to 1, so the fusion stays a weighted average. |
+| Initial `w` | 0.1 (`PERSONALIZATION_INIT`) | As specified |
+| Learning rate of `w` | 1e-2 (`PERSONALIZATION_LR`; `0` keeps `w` fixed) | Adam moves a scalar by about its learning rate per step. At the LoRA rate (1e-4), `w` could change by only ~0.005 over the whole run. |
+| Weight decay on `w` | none | Decay would pull θ toward 0, i.e. `w` toward 0.5. |
+| General branch | Frozen, run under `torch.no_grad()` | It has no trainable parameters, so it costs one extra forward pass but no activation memory. |
+| Vision tower | Shared | It has no adapters, so both branches see identical image features. |
+
+`w` is saved with the adapter (PEFT `modules_to_save`) and printed in the training log as `personalization_weight`. The LoRA weights start at zero, so both branches agree at first and `w` only starts moving once LoRA does.
+
+**What it costs.**
+- Training does one extra forward pass per step (about 1.3× compute, no extra activation memory).
+- Inference does two forward passes per token and keeps two KV caches (about 2× compute and cache memory).
+- The vision tower runs once per branch during prefill.
+
+The run is evaluated with VLMEvalKit's own `Qwen2VLChat` and the same V* protocol (`scripts/vlmeval_dual.py` registers a subclass that loads the dual-branch model), so scores compare directly with the other runs.
+
+**Limits.**
+- A dual-branch adapter can't be merged: the general branch needs the untouched base weights, and `merge_lora` refuses it.
+- vLLM isn't supported.
+- With `w ≈ 0.1`, LoRA's effect on the output is damped about 10×, so the model personalizes more slowly than the standard run. If it underfits, raising the LoRA learning rate is the first thing to try.
+
+Using it from Python:
+
+```python
+from train.dual_branch import load_dual_branch, personalization_weight
+model = load_dual_branch('models/Qwen2.5-VL-7B-Instruct', 'checkpoints/capimagine-lora-dual',
+                         torch_dtype='bfloat16', device_map='auto')
+print(personalization_weight(model))      # the learned w
+output_ids = model.generate(**inputs)     # inputs from the Qwen2.5-VL processor; every token from the fused representation
+```
+
 ## Repository layout
 
 ```
@@ -169,14 +220,18 @@ scripts/summarize_vstar.py      Attribute / Spatial / Overall vs. the paper, plu
 scripts/download_data.sh        CapImagine-Data and the Qwen2.5-VL-7B-Instruct base model
 scripts/train_lora.sh           torchrun launcher with the paper's global batch size
 scripts/train_lora_goldfish.sh  the same run with the goldfish loss (k=4, h=13)
+scripts/train_lora_dual.sh      the same run as a dual-branch (general + LoRA) model
+scripts/vlmeval_dual.py         VLMEvalKit's run.py plus the dual-branch model class
 train/data.py                   CapImagine-Data records -> Qwen2.5-VL chat messages
 train/collator.py               tokenization, Monet's image budget, assistant-only labels
 train/train_lora.py             PEFT LoRA + HF Trainer, with a gradient-accumulation-safe loss
 train/goldfish.py               goldfish-loss token mask, ported from the official implementation
+train/dual_branch.py            dual-branch Qwen2.5-VL: two passes per token, fused representation, two KV caches
 train/merge_lora.py             merges an adapter into a standalone model for evaluation
 train/inspect_data.py           schema and image-path check of the dataset, no GPU needed
 tests/                          offline tests (pytest): summary logic; VLMEvalKit's own V* prompt and
                                 scoring code on synthetic outputs; LoRA training, label masking and
                                 merging on a tiny random Qwen2.5-VL (CPU); goldfish mask vs. a verbatim
-                                copy of the official code
+                                copy of the official code; dual-branch fusion, per-branch KV caches,
+                                training and reloading
 ```
