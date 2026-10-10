@@ -14,6 +14,9 @@ of the language model) are the usual LoRA counterparts, not values from the pape
 Add `--goldfish_strategy hash-table --k_goldfish 4 --goldfish_context_width 13` to train with
 the goldfish loss (train/goldfish.py) instead of the standard next-token loss.
 
+Add `--dual_branch True` to train the dual-branch model (train/dual_branch.py): the loss is computed
+on the fused representation (1 - w) * general + w * personalised, with w learnable from 0.1.
+
 Every `transformers.TrainingArguments` flag is accepted as well.
 """
 import logging
@@ -29,6 +32,7 @@ from transformers.trainer_utils import SaveStrategy
 
 from train.collator import IGNORE_INDEX, QwenVLSFTCollator
 from train.data import MONET_SYSTEM_PROMPT, CapImagineDataset
+from train.dual_branch import GATE_MODULE, personalization_weight, to_dual_branch
 from train.goldfish import STRATEGIES as GOLDFISH_STRATEGIES
 
 logger = logging.getLogger(__name__)
@@ -75,6 +79,14 @@ class GoldfishArguments:
 
 
 @dataclass
+class DualBranchArguments:
+    dual_branch: bool = field(default=False, metadata={'help': 'fuse a frozen general branch with the LoRA branch'})
+    personalization_init: float = field(default=0.1, metadata={'help': 'initial weight w of the LoRA branch'})
+    personalization_lr: float = field(default=1e-2, metadata={'help': 'learning rate of w (0 keeps it fixed). '
+                                      'Adam moves a scalar by about lr per step, so at the LoRA lr w would barely move'})
+
+
+@dataclass
 class TrainArguments(TrainingArguments):
     learning_rate: float = 1e-4
     num_train_epochs: float = 4
@@ -108,16 +120,47 @@ def token_weighted_ce(outputs, labels, num_items_in_batch=None):
     return loss / n_tokens
 
 
-def build_model(model_args, lora_args, train_args):
+class LoraTrainer(Trainer):
+    """Trainer that, for the dual-branch model, gives the fusion weight its own lr (no weight decay) and logs it."""
+
+    def __init__(self, *args, personalization_lr=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.personalization_lr = personalization_lr
+
+    def create_optimizer(self):
+        if self.optimizer is not None or self.personalization_lr is None:
+            return super().create_optimizer()
+        params = [(n, p) for n, p in self.model.named_parameters() if p.requires_grad]
+        gate = {n for n, _ in params if GATE_MODULE in n}
+        decay = set(self.get_decay_parameter_names(self.model)) - gate
+        groups = [
+            {'params': [p for n, p in params if n in decay], 'weight_decay': self.args.weight_decay},
+            {'params': [p for n, p in params if n not in decay and n not in gate], 'weight_decay': 0.0},
+            {'params': [p for n, p in params if n in gate], 'weight_decay': 0.0, 'lr': self.personalization_lr},
+        ]
+        optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(self.args, self.model)
+        self.optimizer = optimizer_cls([g for g in groups if g['params']], **optimizer_kwargs)
+        return self.optimizer
+
+    def log(self, logs, *args, **kwargs):
+        if self.personalization_lr is not None:
+            logs['personalization_weight'] = personalization_weight(self.model)
+        super().log(logs, *args, **kwargs)
+
+
+def build_model(model_args, lora_args, train_args, dual_args):
     dtype = torch.bfloat16 if train_args.bf16 else torch.float32
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         model_args.model_name_or_path, torch_dtype=dtype, attn_implementation=model_args.attn_implementation)
     model.config.use_cache = False
     if train_args.gradient_checkpointing:
         model.enable_input_require_grads()
+    if dual_args.dual_branch:
+        model = to_dual_branch(model, dual_args.personalization_init)
 
     lora_config = LoraConfig(r=lora_args.lora_r, lora_alpha=lora_args.lora_alpha, lora_dropout=lora_args.lora_dropout,
-                             target_modules=lora_args.lora_target_modules, bias='none', task_type='CAUSAL_LM')
+                             target_modules=lora_args.lora_target_modules, bias='none', task_type='CAUSAL_LM',
+                             modules_to_save=[GATE_MODULE] if dual_args.dual_branch else None)
     model = get_peft_model(model, lora_config)
     lora_modules = [n for n, _ in model.named_modules() if n.endswith('.lora_A')]
     if not lora_modules:
@@ -141,8 +184,10 @@ def log_example(dataset, collator, tokenizer):
 
 
 def main(argv=None):
-    parser = HfArgumentParser((ModelArguments, DataArguments, LoraArguments, GoldfishArguments, TrainArguments))
-    model_args, data_args, lora_args, goldfish_args, train_args = parser.parse_args_into_dataclasses(args=argv)
+    parser = HfArgumentParser((ModelArguments, DataArguments, LoraArguments, GoldfishArguments, DualBranchArguments,
+                               TrainArguments))
+    model_args, data_args, lora_args, goldfish_args, dual_args, train_args = \
+        parser.parse_args_into_dataclasses(args=argv)
     if not data_args.data_path or not train_args.output_dir:
         parser.error('--data_path and --output_dir are required')
     if goldfish_args.goldfish_strategy is not None:
@@ -172,12 +217,13 @@ def main(argv=None):
     if train_args.local_rank in (-1, 0):
         log_example(dataset, collator, processor.tokenizer)
 
-    model = build_model(model_args, lora_args, train_args)
+    model = build_model(model_args, lora_args, train_args, dual_args)
     if train_args.local_rank in (-1, 0):
         model.print_trainable_parameters()
 
-    trainer = Trainer(model=model, args=train_args, train_dataset=dataset, data_collator=collator,
-                      processing_class=processor, compute_loss_func=token_weighted_ce)
+    trainer = LoraTrainer(model=model, args=train_args, train_dataset=dataset, data_collator=collator,
+                          processing_class=processor, compute_loss_func=token_weighted_ce,
+                          personalization_lr=dual_args.personalization_lr if dual_args.dual_branch else None)
     trainer.train(resume_from_checkpoint=train_args.resume_from_checkpoint)
     trainer.save_model(train_args.output_dir)
     if trainer.is_world_process_zero():

@@ -92,3 +92,17 @@ def test_exact_matching_misses_reasoning_answers(tmp_path, monkeypatch):
     assert summary['splits']['Attribute']['correct'] == 1
     assert summary['splits']['Spatial']['correct'] == 1
     assert summary['n_exact_match_fallback'] >= 2
+
+
+def test_dual_branch_model_class_is_registered():
+    import importlib.util
+
+    from vlmeval.vlm import Qwen2VLChat
+    path = os.path.join(os.path.dirname(__file__), '..', 'scripts', 'vlmeval_dual.py')
+    spec = importlib.util.spec_from_file_location('vlmeval_dual', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # registers the class; run.py only runs under __main__
+    assert vlmeval.vlm.DualBranchQwen2VLChat is module.DualBranchQwen2VLChat
+    assert issubclass(module.DualBranchQwen2VLChat, Qwen2VLChat)
+    with pytest.raises(ValueError, match='transformers backend'):
+        module.DualBranchQwen2VLChat(model_path='unused', adapter_path='unused', use_vllm=True)

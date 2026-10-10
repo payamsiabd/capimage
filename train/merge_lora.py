@@ -12,8 +12,14 @@ import torch
 from peft import PeftConfig, PeftModel
 from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
+from train.dual_branch import is_dual_branch_adapter
+
 
 def merge(adapter, output, base=None, dtype=torch.bfloat16):
+    if is_dual_branch_adapter(adapter):
+        raise ValueError(f'{adapter} is a dual-branch adapter: its general branch needs the unmerged base weights, so '
+                         'it cannot become one model. Evaluate it with MODEL=dual ADAPTER_PATH=<adapter> '
+                         'bash scripts/run_vstar.sh')
     base = base or PeftConfig.from_pretrained(adapter).base_model_name_or_path
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(base, torch_dtype=dtype)
     model = PeftModel.from_pretrained(model, adapter).merge_and_unload()
